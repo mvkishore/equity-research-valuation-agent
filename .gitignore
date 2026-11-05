@@ -1,0 +1,15 @@
+node_modules/
+client/dist/
+client/dist-cvm/
+server/dist/
+*.tsbuildinfo
+app.db
+app.db-shm
+app.db-wal
+.bun-cache/
+.harness/
+.space-build/
+.space-build-cvm/
+audits/
+*.muse-github-snapshot-sync.json
+.DS_Store

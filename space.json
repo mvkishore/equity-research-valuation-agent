@@ -1,0 +1,8 @@
+{
+  "runtime": "typescript",
+  "platformVersion": 28,
+  "entry": "client/dist/index.html",
+  "name": "Equity Research & Valuation Agent",
+  "slug": "equity-research-valuation-agent",
+  "managedCronJobs": []
+}
