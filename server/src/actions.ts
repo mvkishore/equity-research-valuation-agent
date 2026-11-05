@@ -1,5 +1,5 @@
-import { defineAction, z, type ActionsModule } from "@hatch/space-sdk";
-import { desc, eq } from "drizzle-orm";
+import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
+import { and, desc, eq, lt, or } from "drizzle-orm";
 import * as schema from "./schema";
 
 // ---------- helpers ----------
@@ -93,6 +93,91 @@ const synthesisSchema = z.object({
   dataGaps: z.array(z.string()),
 });
 
+// PIPELINE SHAPE — measured, not guessed. Each action invocation has a hard
+// overall deadline, and inference wall-time is the binding constraint. For
+// MELI, probe timings were: fundamentals synthesis ≈74s, narrative synthesis
+// ≈72s, research ≈5s. One combined call (~150s+) blew the deadline and the
+// run sat forever on the client's final "DCF" stage (the DCF math itself is
+// milliseconds); two calls inside one action starved the same way. So the
+// pipeline is two ACTIONS — beginAnalysis (quote + research + fundamentals
+// call) and completeAnalysis (narrative call + deterministic DCF + save) —
+// each with exactly one inference call and its own fresh deadline, chained
+// by the client, with the intermediate state in the analysis_drafts table.
+async function completeWithRetry<T>(ctx: Ctx, prompt: string, schema: z.ZodType<T>): Promise<T> {
+  try {
+    return await ctx.inference.complete(prompt, { schema });
+  } catch (e) {
+    // Retry only fast failures (e.g. schema validation). Never retry a
+    // timeout: the retry would consume the time the rest of the action needs.
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/timed out|timeout|deadline/i.test(msg)) throw e;
+    return await ctx.inference.complete(prompt, { schema });
+  }
+}
+
+const fundamentalsSchema = z.object({
+  companyName: z.string(),
+  sector: z.string().nullable(),
+  reportingPeriod: z.string().nullable(),
+  revenueBn: z.number().nullable(),
+  revenueGrowthPct: z.number().nullable(),
+  grossMarginPct: z.number().nullable(),
+  operatingMarginPct: z.number().nullable(),
+  netMarginPct: z.number().nullable(),
+  roicPct: z.number().nullable(),
+  roePct: z.number().nullable(),
+  fcfBn: z.number().nullable(),
+  ocfBn: z.number().nullable(),
+  capexBn: z.number().nullable(),
+  sbcBn: z.number().nullable(),
+  fcfMarginPct: z.number().nullable(),
+  dilutionPctPerYear: z.number().nullable(),
+  netCashBn: z.number().nullable(),
+  sharesDilutedBn: z.number().nullable(),
+  epsDiluted: z.number().nullable(),
+  dividendYieldPct: z.number().nullable(),
+  debtToEbitda: z.number().nullable(),
+  history: z.array(z.object({ year: z.string(), revenueBn: z.number().nullable(), fcfBn: z.number().nullable() })),
+  scores: scoreSchema,
+  scoreNotes: z.object({
+    businessQuality: z.string(), moat: z.string(), growthDurability: z.string(), profitability: z.string(),
+    fcfGeneration: z.string(), balanceSheet: z.string(), capitalAllocation: z.string(), management: z.string(),
+    valuationAttractiveness: z.string(), riskProfile: z.string(),
+  }),
+  bear: z.object({ fcfGrowthPct: z.number(), discountPct: z.number(), terminalGrowthPct: z.number() }),
+  base: z.object({ fcfGrowthPct: z.number(), discountPct: z.number(), terminalGrowthPct: z.number() }),
+  bull: z.object({ fcfGrowthPct: z.number(), discountPct: z.number(), terminalGrowthPct: z.number() }),
+  recommendation: z.enum(["Strong Buy", "Buy", "Accumulate", "Hold", "Watchlist", "Trim", "Sell"]),
+  conviction: z.enum(["High", "Medium", "Low"]),
+  dataGaps: z.array(z.string()),
+});
+
+const narrativeSchema = z.object({
+  businessSummary: z.string(),
+  revenueStreams: z.array(z.string()),
+  customers: z.string().nullable(),
+  moatType: z.string(),
+  moatAssessment: z.string(),
+  moatSources: z.array(z.string()),
+  competitors: z.array(z.string()),
+  whyCustomersStay: z.string(),
+  industryNote: z.string(),
+  managementNote: z.string(),
+  capitalAllocationNote: z.string(),
+  sbcNote: z.string(),
+  thesis: z.string(),
+  thesisBreakers: z.array(z.string()),
+  reasonsToOwn: z.array(z.string()),
+  reasonsNotToOwn: z.array(z.string()),
+  risks: z.array(z.object({ title: z.string(), category: z.string(), detail: z.string(), signal: z.string() })),
+  monitorMetrics: z.array(z.string()),
+  guidanceNote: z.string().nullable(),
+  bearNarrative: z.string(),
+  baseNarrative: z.string(),
+  bullNarrative: z.string(),
+  dataGaps: z.array(z.string()),
+});
+
 const analysisSummary = z.object({
   id: z.number(), ticker: z.string(), companyName: z.string(), createdAt: z.string(),
   price: z.number().nullable(), marketCap: z.number().nullable(), currency: z.string(), priceAsOf: z.string().nullable(),
@@ -138,10 +223,10 @@ export const Actions = {
     },
   }),
 
-  analyzeTicker: defineAction({
-    description: "Runs a full buy-side committee analysis for a ticker: live quote, web-researched fundamentals, scorecard, deterministic DCF scenarios, margin of safety, risks and thesis — saved as a new version.",
+  beginAnalysis: defineAction({
+    description: "Step 1 of a committee analysis: live quote, web research, and the fundamentals/scorecard synthesis — saved as a draft for completeAnalysis to finish. Split into two actions because one combined synthesis call exceeds the action deadline for heavy tickers (MELI).",
     request: z.object({ ticker: z.string().min(1).max(12) }),
-    response: z.object({ analysis: analysisSummary }),
+    response: z.object({ draftId: z.number(), ticker: z.string() }),
     async handler(ctx, args) {
       const ticker = args.ticker.toUpperCase().trim();
       const db = ctx.db<typeof schema>();
@@ -158,12 +243,10 @@ export const Actions = {
         ctx.tool.web_search(`${ticker} ${companyNameGuess} competitive moat competitors market share management capital allocation buybacks stock based compensation dilution`),
         ctx.tool.web_search(`${ticker} ${companyNameGuess} latest earnings results guidance risks outlook most recent quarter`),
       ]);
-      const fmt = (s: typeof s1) => s.content.results.map((r) => `- [${r.title}] ${r.snippet ?? ""}`).join("\n").slice(0, 7000);
+      const fmt = (s: typeof s1) => s.content.results.map((r) => `- [${r.title}] ${r.snippet ?? ""}`).join("\n").slice(0, 3200);
       const sources = [...s1.content.sources, ...s2.content.sources, ...s3.content.sources].slice(0, 12);
 
-      const prompt = `You are a disciplined buy-side equity analyst in the Buffett / Munger / Graham tradition. Analyze ${companyNameGuess} (${ticker}) using ONLY the research snippets below plus the live quote. Never invent a figure: if a number is not supported by the snippets, return null for it and list it in dataGaps. Distinguish reported figures from estimates in reportingPeriod. Be skeptical: judge business quality separately from valuation. Score each dimension 0-10 honestly (10 = best; for riskProfile 10 = lowest risk). Treat stock-based compensation as a real cost in sbcNote and dilution. Scenario assumptions are 5-year FCF growth rates: bear must be genuinely adverse, bull genuinely strong but plausible; discount rate 7-12% for most businesses, terminal growth 1.5-3%.
-
-LIVE QUOTE: price ${price} ${inst.currency ?? "USD"}, market cap ${marketCap ?? "unknown"}, 52-week range ${inst.week_52_low ?? "?"}–${inst.week_52_high ?? "?"}, beta ${inst.beta ?? "?"}. Quote summary: ${inst.summary.slice(0, 1200)}
+      const researchBlocks = `LIVE QUOTE: price ${price} ${inst.currency ?? "USD"}, market cap ${marketCap ?? "unknown"}, 52-week range ${inst.week_52_low ?? "?"}–${inst.week_52_high ?? "?"}, beta ${inst.beta ?? "?"}. Quote summary: ${inst.summary.slice(0, 1000)}
 
 FINANCIALS RESEARCH:
 ${fmt(s1)}
@@ -172,11 +255,90 @@ MOAT / MANAGEMENT / CAPITAL ALLOCATION RESEARCH:
 ${fmt(s2)}
 
 EARNINGS / GUIDANCE / RISKS RESEARCH:
-${fmt(s3)}
+${fmt(s3)}`;
 
-All monetary values in billions of USD (revenueBn, fcfBn, ocfBn, capexBn, sbcBn, netCashBn where net debt is negative). Percentages as plain numbers (e.g. 28.4 means 28.4%). History: up to 6 most recent fiscal years, oldest first. Provide at least 4 risks and at least 3 thesis breakers, 3 reasons to own and 3 reasons not to own where the evidence supports them.`;
+      const fundPrompt = `You are a disciplined buy-side equity analyst in the Buffett / Munger / Graham tradition. Extract the reported fundamentals and score ${companyNameGuess} (${ticker}) using ONLY the research below plus the live quote. Never invent a figure: if a number is not supported by the research, return null for it and list it in dataGaps. Distinguish reported figures from estimates in reportingPeriod. Be skeptical: judge business quality separately from valuation. Score each dimension 0-10 honestly (10 = best; for riskProfile 10 = lowest risk), each scoreNote ONE sentence grounded in the figures — this step is data extraction, not essay writing. Scenario assumptions are 5-year FCF growth rates: bear genuinely adverse, bull genuinely strong but plausible; discount rate 7-12% for most businesses, terminal growth 1.5-3%. All monetary values in billions of USD (netCashBn negative = net debt). Percentages as plain numbers (28.4 means 28.4%). History: up to 5 most recent fiscal years, oldest first.
 
-      const syn = await ctx.inference.complete(prompt, { schema: synthesisSchema });
+${researchBlocks}`;
+
+      const fund = await completeWithRetry(ctx, fundPrompt, fundamentalsSchema);
+
+      // Replace any older unfinished draft for this ticker, then save this
+      // step's output as the draft completeAnalysis will claim and finish.
+      await db.delete(schema.analysisDrafts).where(eq(schema.analysisDrafts.ticker, ticker));
+      const draftIns = await db.insert(schema.analysisDrafts).values({
+        ticker, companyName: fund.companyName || companyNameGuess,
+        price, marketCap: marketCap ?? null, currency: inst.currency ?? "USD", priceAsOf: inst.as_of,
+        payload: JSON.stringify({
+          fund, sources, researchBlocks,
+          historyPoints: (inst.history?.points ?? []).map((p) => ({ date: p.date ?? "", close: p.close })),
+        }),
+      }).returning({ id: schema.analysisDrafts.id });
+      const draftRow = draftIns[0];
+      if (!draftRow) throw new Error("Failed to save the analysis draft.");
+      ctx.invalidateQueries();
+      return { draftId: draftRow.id, ticker };
+    },
+  }),
+
+  completeAnalysis: defineAction({
+    description: "Step 2 of a committee analysis: claims the draft from beginAnalysis, runs the narrative synthesis (business, moat, thesis, risks), computes the bear/base/bull DCF, reverse DCF and verdict in code, and saves the finished report.",
+    request: z.object({ draftId: z.number().int().positive() }),
+    response: z.object({ status: z.enum(["completed", "in-progress", "missing"]), analysis: analysisSummary.nullable() }),
+    async handler(ctx, args): Promise<{ status: "completed" | "in-progress" | "missing"; analysis: z.infer<typeof analysisSummary> | null }> {
+      const db = ctx.db<typeof schema>();
+      const draftRows = await db.select().from(schema.analysisDrafts).where(eq(schema.analysisDrafts.id, args.draftId)).limit(1);
+      const draft = draftRows[0];
+      if (!draft || draft.price == null) return { status: "missing", analysis: null };
+      // Claim the draft so only one completion runs at a time (a page reload
+      // or an automatic retry must not produce duplicate reports). A claim
+      // older than 3 minutes is stale — the narrative call takes ~75s — and
+      // may be reclaimed.
+      const claimed = await db.update(schema.analysisDrafts)
+        .set({ status: "running", claimedAt: new Date() })
+        .where(and(
+          eq(schema.analysisDrafts.id, draft.id),
+          or(eq(schema.analysisDrafts.status, "pending"), lt(schema.analysisDrafts.claimedAt, new Date(Date.now() - 180_000))),
+        ))
+        .returning({ id: schema.analysisDrafts.id });
+      if (claimed.length === 0) return { status: "in-progress", analysis: null };
+
+      const ticker = draft.ticker;
+      const price = draft.price;
+      const marketCap = draft.marketCap;
+      type DraftPayload = {
+        fund: z.infer<typeof fundamentalsSchema>;
+        sources: { title: string; url: string }[];
+        researchBlocks: string;
+        historyPoints: { date: string; close: number | null }[];
+      };
+      let draftPayload: DraftPayload;
+      let syn: z.infer<typeof synthesisSchema>;
+      try {
+        draftPayload = JSON.parse(draft.payload) as DraftPayload;
+        const fund = draftPayload.fund;
+        const keyFigures = `EXTRACTED FIGURES (step 1): revenue ${fund.revenueBn ?? "n/a"}B (growth ${fund.revenueGrowthPct ?? "n/a"}%), gross margin ${fund.grossMarginPct ?? "n/a"}%, operating margin ${fund.operatingMarginPct ?? "n/a"}%, ROIC ${fund.roicPct ?? "n/a"}%, FCF ${fund.fcfBn ?? "n/a"}B (margin ${fund.fcfMarginPct ?? "n/a"}%), SBC ${fund.sbcBn ?? "n/a"}B, dilution ${fund.dilutionPctPerYear ?? "n/a"}%/yr, net cash ${fund.netCashBn ?? "n/a"}B, reporting period: ${fund.reportingPeriod ?? "latest reported"}. Scenario FCF growth assumptions already set: bear ${fund.bear.fcfGrowthPct}%, base ${fund.base.fcfGrowthPct}%, bull ${fund.bull.fcfGrowthPct}%. Draft scores: quality ${fund.scores.businessQuality}/10, moat ${fund.scores.moat}/10, valuation attractiveness ${fund.scores.valuationAttractiveness}/10.`;
+
+        const narrPrompt = `You are a disciplined buy-side equity analyst in the Buffett / Munger / Graham tradition. Write the qualitative committee work for ${draft.companyName} (${ticker}) using ONLY the research below and the extracted figures. Never invent a figure. Treat stock-based compensation as a real cost in sbcNote. Be skeptical, specific and economical: businessSummary at most 110 words; moatAssessment, industryNote, managementNote, capitalAllocationNote and sbcNote at most 80 words each; thesis at most 110 words; each risk detail at most 55 words; each reason and thesis breaker one sentence. Provide exactly 5 risks (each with the observable warning signal), 4 thesis breakers, 4 reasons to own and 4 reasons not to own. The bear/base/bull narratives (one to two sentences each) must match the scenario growth assumptions in the extracted figures. List anything material the research does not support in dataGaps.
+
+${keyFigures}
+
+${draftPayload.researchBlocks}`;
+
+        const narr = await completeWithRetry(ctx, narrPrompt, narrativeSchema);
+        syn = {
+          ...fund, ...narr,
+          bear: { ...fund.bear, narrative: narr.bearNarrative },
+          base: { ...fund.base, narrative: narr.baseNarrative },
+          bull: { ...fund.bull, narrative: narr.bullNarrative },
+          dataGaps: [...fund.dataGaps, ...narr.dataGaps],
+        };
+      } catch (e) {
+        // Release the claim so the step can be retried, then surface the error.
+        await db.update(schema.analysisDrafts).set({ status: "pending", claimedAt: null }).where(eq(schema.analysisDrafts.id, draft.id));
+        throw e;
+      }
+      const sources = draftPayload.sources;
 
       // Deterministic DCF
       const sharesBn = syn.sharesDilutedBn ?? (marketCap && price ? marketCap / price / 1e9 : null);
@@ -241,13 +403,13 @@ All monetary values in billions of USD (revenueBn, fcfBn, ocfBn, capexBn, sbcBn,
         syn, sources, netCashAssumed, sharesBnUsed: sharesBn, fcf0UsedBn: fcf0, verdictNote, analystDraftRecommendation: syn.recommendation,
         intrinsicBase: ivBase, intrinsicWeighted: ivWeighted,
         impliedGrowthPct: implied, changeDetection, valueVerdict,
-        historyPoints: (inst.history?.points ?? []).map((p) => ({ date: p.date ?? "", close: p.close })),
+        historyPoints: draftPayload.historyPoints,
         entryPrices: ivBase != null ? { mos10: ivBase * 0.9, mos20: ivBase * 0.8, mos30: ivBase * 0.7 } : null,
       });
 
       const inserted = await db.insert(schema.analyses).values({
-        ticker, companyName: syn.companyName || companyNameGuess,
-        price, marketCap: marketCap ?? null, currency: inst.currency ?? "USD", priceAsOf: inst.as_of,
+        ticker, companyName: syn.companyName || draft.companyName,
+        price, marketCap: marketCap ?? null, currency: draft.currency, priceAsOf: draft.priceAsOf,
         recommendation: finalRecommendation, conviction: syn.conviction,
         intrinsicBear: ivBear, intrinsicBase: ivBase, intrinsicBull: ivBull, intrinsicWeighted: ivWeighted,
         marginOfSafety: mos, businessQualityScore: syn.scores.businessQuality, valuationScore: syn.scores.valuationAttractiveness,
@@ -255,8 +417,9 @@ All monetary values in billions of USD (revenueBn, fcfBn, ocfBn, capexBn, sbcBn,
       }).returning();
       const row = inserted[0];
       if (!row) throw new Error("Failed to save analysis.");
+      await db.delete(schema.analysisDrafts).where(eq(schema.analysisDrafts.id, draft.id));
       ctx.invalidateQueries();
-      return { analysis: rowToSummary(row) };
+      return { status: "completed", analysis: rowToSummary(row) };
     },
   }),
 

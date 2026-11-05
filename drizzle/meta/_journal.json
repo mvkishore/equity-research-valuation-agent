@@ -15,6 +15,13 @@
       "when": 1793917804661,
       "tag": "0002_research_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793921621412,
+      "tag": "0003_add_analysis_drafts",
+      "breakpoints": true
     }
   ]
 }

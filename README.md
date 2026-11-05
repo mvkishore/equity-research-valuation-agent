@@ -101,15 +101,24 @@ Build outputs:
 
 ### How an analysis runs (1–3 minutes)
 
+Analysis is split into two server steps, each with its own time budget — a
+single combined call could exceed the per-action deadline on research-heavy
+tickers (MELI measured ~150s combined: fundamentals synthesis ~74s +
+narrative synthesis ~72s) and time out.
+
 1. `getQuote` — fast pre-check; a bogus ticker fails in seconds with a clear error.
-2. `analyzeTicker` — live quote, 5+ years of researched financials, moat/risks,
-   scorecard synthesis.
-3. The DCF, reverse DCF, margin-of-safety prices and verdict reconciliation are
-   computed in TypeScript on the server — not by the language model.
+2. `beginAnalysis` — live quote, 5+ years of researched financials; the result
+   is saved as a draft in `analysis_drafts` (migration `0003`).
+3. `completeAnalysis` — moat/thesis/risks narrative, scorecard synthesis, then
+   the DCF, reverse DCF, margin-of-safety prices and verdict reconciliation,
+   all computed in TypeScript on the server — not by the language model.
+   If this step times out, it retries automatically from the saved draft
+   (no duplicates: a consumed draft cannot be completed twice).
 4. The result is saved as a new row/version in `analyses`, which powers the
-   change-detection diff on the next run. The UI polls every ~4 seconds while a
-   run is in flight, so a dropped connection or a page reload recovers and
-   displays the finished report instead of spinning forever.
+   change-detection diff on the next run. The progress panel shows the actual
+   server step (not a clock estimate), and the UI polls while a run is in
+   flight, so a dropped connection or a page reload recovers and displays
+   the finished report instead of spinning forever.
 
 ## Data notes
 

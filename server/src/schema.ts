@@ -21,6 +21,25 @@ export const analyses = sqliteTable("analyses", {
   payload: text("payload").notNull().default("{}"),
 });
 
+// Intermediate state for the two-step analysis pipeline: beginAnalysis saves
+// the extracted fundamentals + research here; completeAnalysis claims the
+// draft, runs the narrative synthesis, computes the DCF and writes the final
+// analyses row. A draft is claimed via status/claimedAt so a resumed or
+// repeated completion cannot produce duplicate reports.
+export const analysisDrafts = sqliteTable("analysis_drafts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  ticker: text("ticker").notNull(),
+  companyName: text("company_name").notNull().default(""),
+  price: real("price"),
+  marketCap: real("market_cap"),
+  currency: text("currency").notNull().default("USD"),
+  priceAsOf: text("price_as_of"),
+  payload: text("payload").notNull().default("{}"),
+  status: text("status", { enum: ["pending", "running"] }).notNull().default("pending"),
+  claimedAt: integer("claimed_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+});
+
 export const positions = sqliteTable("positions", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   ticker: text("ticker").notNull(),

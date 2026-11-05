@@ -432,14 +432,19 @@ function CompareTab() {
 }
 
 const ANALYSIS_STAGES = [
-  { label: "Pulling the live quote and price history", at: 0 },
-  { label: "Researching five-plus years of financials, moat, competitors and risks", at: 6 },
-  { label: "Committee synthesis — business quality, SBC honesty check, thesis breakers", at: 25 },
-  { label: "Computing bear / base / bull DCF, reverse DCF and margin-of-safety entry prices", at: 60 },
+  "Pulling the live quote and price history",
+  "Researching five-plus years of financials, moat, competitors and risks",
+  "Step 1 of 2 — fundamentals & scorecard: reported figures, SBC, dilution, scenario assumptions",
+  "Step 2 of 2 — committee narrative: moat, thesis, risks, scenario stories",
+  "Then the DCF, reverse DCF and verdict — computed in code, in seconds",
 ];
 
-function ProgressPanel({ ticker, elapsed, connIssue }: { ticker: string; elapsed: number; connIssue: boolean }) {
-  const current = ANALYSIS_STAGES.reduce((acc, s, i) => (elapsed >= s.at ? i : acc), 0);
+function ProgressPanel({ ticker, elapsed, connIssue, phase }: { ticker: string; elapsed: number; connIssue: boolean; phase: "fundamentals" | "narrative" }) {
+  // Stage position follows the REAL pipeline phase, not just the clock: the
+  // old panel advanced to "computing the DCF" after 60s even when the server
+  // was still synthesizing (or had died), which is exactly how a stalled
+  // MELI run looked like it was stuck on the DCF step.
+  const current = phase === "narrative" ? 3 : elapsed < 10 ? 1 : 2;
   const mmss = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
   return (
     <div className="mt-3 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4" role="status" aria-live="polite" aria-label={`Analysis of ${ticker} in progress`}>
@@ -448,26 +453,32 @@ function ProgressPanel({ ticker, elapsed, connIssue }: { ticker: string; elapsed
         <p className="text-sm tabular-nums" style={{ fontFamily: "var(--serif)" }}>{mmss} elapsed</p>
       </div>
       <ol className="mt-3 space-y-2">
-        {ANALYSIS_STAGES.map((s, i) => (
-          <li key={s.label} className="flex items-center gap-2 text-sm" style={i > current ? { color: "var(--dim)" } : undefined}>
+        {ANALYSIS_STAGES.map((label, i) => (
+          <li key={label} className="flex items-center gap-2 text-sm" style={i > current ? { color: "var(--dim)" } : undefined}>
             {i < current
               ? <span aria-hidden="true" className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold" style={{ background: "var(--green)", color: "#fff" }}>✓</span>
               : i === current
                 ? <span aria-hidden="true" className="h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-[var(--border)]" style={{ borderTopColor: "var(--accent)" }} />
                 : <span aria-hidden="true" className="h-5 w-5 shrink-0 rounded-full border-2 border-[var(--border)]" />}
-            <span>{s.label}{i === current ? "…" : ""}</span>
+            <span>{label}{i === current ? "…" : ""}</span>
           </li>
         ))}
       </ol>
-      <p className="mt-3 text-xs leading-relaxed text-[var(--dim)]">A full committee report typically takes 1–3 minutes — the research and synthesis steps do the heavy lifting. You can switch tabs, or close and reopen this page: the finished report is saved to your shelf automatically the moment it completes.</p>
-      {connIssue && <p className="mt-2 text-xs font-medium" style={{ color: "var(--brass)" }}>The connection to the running analysis dropped — don't close this yet; we're checking whether the finished report still arrives.</p>}
-      {!connIssue && elapsed >= 120 && <p className="mt-2 text-xs font-medium" style={{ color: "var(--brass)" }}>Taking longer than usual — still working. The report will appear here as soon as it is saved.</p>}
+      <p className="mt-3 text-xs leading-relaxed text-[var(--dim)]">The analysis runs as two server steps of about a minute each — splitting them is what keeps heavy tickers like MELI from timing out mid-report. You can switch tabs, or close and reopen this page: progress is kept and the finished report is saved to your shelf automatically the moment it completes.</p>
+      {connIssue && <p className="mt-2 text-xs font-medium" style={{ color: "var(--brass)" }}>The connection to the running analysis dropped — don't close this yet; we're checking whether the finished report still arrives, and step 2 can resume from the saved step 1.</p>}
+      {!connIssue && elapsed >= 150 && <p className="mt-2 text-xs font-medium" style={{ color: "var(--brass)" }}>Taking longer than usual — still working. The report will appear here as soon as it is saved.</p>}
     </div>
   );
 }
 
 const RUN_KEY = "eqr-pending-analysis";
-type PendingRun = { ticker: string; startedAt: number; baselineId: number };
+type PendingRun = { ticker: string; startedAt: number; baselineId: number; phase: "fundamentals" | "narrative"; draftId: number | null };
+
+function friendlyRunError(ticker: string, msg: string | null): string {
+  if (msg && /timed out|timeout/i.test(msg)) return `The ${ticker} analysis timed out on the server and no report was saved. It now runs as two shorter steps — please run ${ticker} again.`;
+  if (msg) return `The ${ticker} analysis didn't complete (${msg.slice(0, 140)}). No report was saved — please run it again.`;
+  return `The ${ticker} analysis didn't complete and no finished report arrived. Please run it again.`;
+}
 
 export function App() {
   const qc = useQueryClient();
@@ -480,6 +491,9 @@ export function App() {
   const [checking, setChecking] = useState(false);
   const [connIssue, setConnIssue] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
+  const [runErrMsg, setRunErrMsg] = useState<string | null>(null);
+  const [errAt, setErrAt] = useState<number | null>(null);
+  const [step2FireAt, setStep2FireAt] = useState(0);
   const [elapsed, setElapsed] = useState(0);
 
   const finishRun = useCallback((id: number) => {
@@ -487,18 +501,54 @@ export function App() {
     setRun(null);
     setConnIssue(false);
     setRunError(null);
+    setRunErrMsg(null);
+    setErrAt(null);
     try { localStorage.removeItem(RUN_KEY); } catch { /* storage unavailable */ }
     qc.invalidateQueries({ queryKey: ["analyses"] });
   }, [qc]);
 
-  const analyze = useMutation({
-    mutationFn: (t: string) => api.analyzeTicker({ ticker: t }),
-    onSuccess: (d) => finishRun(d.analysis.id),
-    // A dropped or timed-out request does not mean the server stopped: the
-    // report is saved before the response returns, so it often lands anyway.
-    // Keep the run alive and let the poll below recover the finished report
-    // instead of dead-ending on an endless spinner or a bare error.
-    onError: () => setConnIssue(true),
+  // A dropped or timed-out request does not mean the server stopped: the
+  // report is saved before the response returns, so it often lands anyway.
+  // Record the error and let the poll below recover the finished report — or
+  // surface the real server error after a grace window — instead of spinning
+  // forever.
+  const noteError = useCallback((err: unknown) => {
+    setConnIssue(true);
+    setRunErrMsg(err instanceof Error ? err.message : String(err));
+    setErrAt(Date.now());
+  }, []);
+
+  const completeMut = useMutation({
+    mutationFn: (draftId: number) => api.completeAnalysis({ draftId }),
+    onSuccess: (d) => {
+      if (d.status === "completed" && d.analysis) { finishRun(d.analysis.id); return; }
+      if (d.status === "in-progress") {
+        // Another completion already holds the server claim and is actively
+        // working — clear any earlier error so the terminal-failure logic
+        // doesn't fire while its saved report is on the way to the poll.
+        setConnIssue(false);
+        setErrAt(null);
+        setRunErrMsg(null);
+      }
+      // "missing": draft gone (likely completed elsewhere); the poll finds
+      // the report if one landed, else its terminal logic reports it.
+    },
+    onError: noteError,
+  });
+
+  const beginMut = useMutation({
+    mutationFn: (t: string) => api.beginAnalysis({ ticker: t }),
+    onSuccess: (d) => {
+      setRun((r) => {
+        if (!r || r.ticker !== d.ticker) return r;
+        const nr: PendingRun = { ...r, phase: "narrative", draftId: d.draftId };
+        try { localStorage.setItem(RUN_KEY, JSON.stringify(nr)); } catch { /* storage unavailable */ }
+        return nr;
+      });
+      setStep2FireAt(Date.now());
+      completeMut.mutate(d.draftId);
+    },
+    onError: noteError,
   });
 
   const startRun = async (raw: string) => {
@@ -515,22 +565,33 @@ export function App() {
       }
     } catch { /* quote check unavailable — let the analysis itself decide */ }
     finally { setChecking(false); }
-    const r: PendingRun = { ticker: tk, startedAt: Date.now(), baselineId: list[0]?.id ?? 0 };
+    const r: PendingRun = { ticker: tk, startedAt: Date.now(), baselineId: list[0]?.id ?? 0, phase: "fundamentals", draftId: null };
     setRun(r);
     setConnIssue(false);
+    setRunErrMsg(null);
+    setErrAt(null);
+    setStep2FireAt(0);
     try { localStorage.setItem(RUN_KEY, JSON.stringify(r)); } catch { /* storage unavailable */ }
-    analyze.mutate(tk);
+    beginMut.mutate(tk);
   };
 
-  // If the page was closed or reloaded mid-analysis, resume watching for the
-  // result — the server-side run finishes and saves independently.
+  // If the page was closed or reloaded mid-analysis, resume watching: step 1
+  // survives as a server-side draft, so a stored draftId lets the poll effect
+  // resume step 2 instead of starting over. Runs stored by the old
+  // single-call version have no draftId — they can only be watched for a
+  // report that already landed, then reported as interrupted.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(RUN_KEY);
       if (!raw) return;
-      const r = JSON.parse(raw) as PendingRun;
-      if (r && typeof r.ticker === "string" && Date.now() - r.startedAt < 15 * 60_000) { setRun(r); setConnIssue(true); }
-      else localStorage.removeItem(RUN_KEY);
+      const stored = JSON.parse(raw) as Partial<PendingRun>;
+      if (stored && typeof stored.ticker === "string" && typeof stored.startedAt === "number" && Date.now() - stored.startedAt < 15 * 60_000) {
+        setRun({
+          ticker: stored.ticker, startedAt: stored.startedAt, baselineId: stored.baselineId ?? 0,
+          phase: stored.draftId != null ? "narrative" : "fundamentals", draftId: stored.draftId ?? null,
+        });
+        setConnIssue(true);
+      } else localStorage.removeItem(RUN_KEY);
     } catch { /* storage unavailable */ }
   }, []);
 
@@ -551,17 +612,39 @@ export function App() {
     enabled: !!run,
     refetchInterval: 4000,
   });
+  const stepPending = beginMut.isPending || completeMut.isPending;
   useEffect(() => {
     if (!run || !poll.data) return;
     const fresh = poll.data.analyses.find((a) => a.id > run.baselineId);
     if (fresh) { finishRun(fresh.id); return; }
-    if (connIssue && !analyze.isPending && Date.now() - run.startedAt > 120_000) {
-      setRun(null);
-      setConnIssue(false);
-      try { localStorage.removeItem(RUN_KEY); } catch { /* storage unavailable */ }
-      setRunError(`The ${run.ticker} analysis didn't complete — the connection was interrupted and no finished report arrived. Please run it again.`);
+    const now = Date.now();
+    // Resume step 2 whenever we hold a draft but no completion call is in
+    // flight — after a page reload, or once a stale server claim can be
+    // reclaimed. Repeat calls are safe: the server claim answers
+    // "in-progress" instead of duplicating the report.
+    if (run.phase === "narrative" && run.draftId != null && !stepPending && now - step2FireAt > 30_000) {
+      setStep2FireAt(now);
+      completeMut.mutate(run.draftId);
+      return;
     }
-  }, [poll.data, run, connIssue, analyze.isPending, finishRun]);
+    // Terminal failure: a step errored and, after a grace window for a saved
+    // report to appear anyway, nothing arrived — surface the real error
+    // instead of spinning forever (the old build's failure mode).
+    if (connIssue && !stepPending) {
+      const errStale = errAt != null && now - errAt > 45_000;
+      const runStale = now - run.startedAt > (run.draftId != null ? 600_000 : 240_000);
+      if (errStale || runStale) {
+        const tk = run.ticker;
+        const msg = runErrMsg;
+        setRun(null);
+        setConnIssue(false);
+        setErrAt(null);
+        setRunErrMsg(null);
+        try { localStorage.removeItem(RUN_KEY); } catch { /* storage unavailable */ }
+        setRunError(friendlyRunError(tk, msg));
+      }
+    }
+  }, [poll.data, run, connIssue, errAt, runErrMsg, step2FireAt, stepPending, finishRun]);
 
   const delAnalysis = useMutation({ mutationFn: (id: number) => api.deleteAnalysis({ id }), onSuccess: () => { setSelectedId(null); qc.invalidateQueries({ queryKey: ["analyses"] }); } });
   const selected = list.find((a) => a.id === selectedId) ?? list[0] ?? null;
@@ -589,7 +672,7 @@ export function App() {
               <input id="ticker-input" value={ticker} onChange={(e) => setTicker(e.target.value.toUpperCase())} placeholder="Ticker — e.g. MSFT, GOOGL, AVGO, CRM" disabled={busy} className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-base disabled:opacity-60" style={{ fontFamily: "var(--serif)" }} />
               <button type="submit" disabled={busy} className="rounded-lg px-5 py-3 text-sm font-semibold disabled:opacity-60" style={{ background: "var(--accent)", color: "var(--accent-text)" }}>{checking ? "Checking…" : run ? "Analyzing…" : "Run committee analysis"}</button>
             </form>
-            {run && <ProgressPanel ticker={run.ticker} elapsed={elapsed} connIssue={connIssue} />}
+            {run && <ProgressPanel ticker={run.ticker} elapsed={elapsed} connIssue={connIssue} phase={run.phase} />}
             {runError && <p className="mt-3 rounded-lg border px-3 py-2 text-sm" style={{ borderColor: "var(--red)", color: "var(--red)" }} role="alert">{runError}</p>}
 
             {latestTickers.length > 0 && (
